@@ -8,7 +8,7 @@ const SocketError = error {
     /// Permission to create a socket of the specified type and/or protocol is denied.
     Access,
     /// The implementation does not support the specified address family.
-    NoSupport,
+    FNoSupport,
     /// Unknown protocol, or protocol family not available. Invalid flags in type.
     Inval,
     /// The per-process limit on the number of open file descriptors has been reached.
@@ -25,7 +25,7 @@ const SocketError = error {
 pub fn socket_error(x: anytype) SocketError {
     switch (@intCast(x,u16)) {
         generic.ACCES => SocketError.Acces
-        generic.AFNOSUPPORT => SocketError.NoSupport,
+        generic.AFNOSUPPORT => SocketError.FNoSupport,
         generic.INVAL => SocketError.Inval,
         generic.NFILE => SocketError.NFIle,
         generic.MFILE => SocketError.MFile,
@@ -142,23 +142,36 @@ pub fn listen_error(x: anytype) ListenError {
         generic.BADF => SetsockoptError.BadF,
         generic.NOTSOCK => SetsockoptError.NotSock,
         generic.OPNOTSUPP => SetsockoptError.OpNotSupp,
-        
         else unreachable
     }
 }
 
 const PthreadSigmaskError = error {
-
+    /// The set or oldset argument points outside the process's allocated address space.
+    Fault,
+    /// Either the value specified in how was invalid or the kernel does not support the size passed
+    /// in sigsetsize.
+    Inval
 };
-pub fn pthread_sigmask_error(x: anytype) PthreadSigmaskError {
-    libc.pthread_sigmask(libc.SIG.SETMASK,)
-}
 /// Blocks interrupt signal on this thread
-pub const pthread_sigmask(signset: SignalSet) {
-    libc.pthread_sigmask(
+pub const pthread_sigmask(sigset: SignalSet) PthreadSigmaskError!void {
+    const result = libc.pthread_sigmask(
         libc.SIG.SETMASK,
-        signset.set
-    ),
+        sigset.set,
+        null
+    );
+    switch (result) {
+        0 => {
+            return;
+        },
+        generic.FAULT => {
+            return PthreadSigmaskError.Fault;
+        },
+        generic.INVAL => {
+            return PthreadSigmaskError.Inval;
+        },
+        else => unreachable,
+    }
 }
 const SigAddSetError = error {
     /// The value of the signo argument is an invalid or unsupported signal number.
@@ -177,7 +190,7 @@ pub const SignalSet = struct {
     pub fn empty() Self {
         return Self { .set = libc.empty_sigset };
     }
-    pub fn add(self: Self,sig) SigAddSetError!void {
+    pub fn add(self: Self,sig: Signal) SigAddSetError!void {
         return sigaddset(self,sig);
     }
     pub fn sigaddset(set: *sigset_t, sig: Signal) SigAddSetError!void {
@@ -186,7 +199,124 @@ pub const SignalSet = struct {
             return SigAddSetError.Inval;
         }
     }
+    /// Returns signal set only containing interrupt.
+    pub fn interrupt() SigAddSetError!Self {
+        var sigset = SignalSet.empty();
+        try sigset.add(Signal.Interrupt);
+        return sigset;
+    }
 }
+
+enum Domain {
+    Unix = libc.AF.UNIX,
+    IPv6 = libc.AF.INET6,
+}
+enum Level {
+    Socket = libc.SOL.SOCKET,
+}
+pub const IPv6Socket = Socket(Domain::IPv6);
+pub fn Socket(comptime domain: Domain) type {
+    return struct {
+        const Self = @This();
+
+        file_descriptor = i32,
+
+        pub const ADDR: type = switch(domain) {
+            Domain.Unix => libc.sockaddr.unm
+            Domain.IPv6 => libc.sockaddr.in6
+        };
+
+        pub const IPv6 = struct {
+            pub fn localhost(port: u16) libc.sockaddr.in6 {
+                return libc.sockaddr.in6 {
+                    .port = port,
+                    .flowinfo = 0,
+                    .addr = [16]u8{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
+                    .scope_id = 0,
+                }
+            }
+        };
+
+        pub const LOCAL_HOST: anytype = switch(domain) {
+            Domain.Unix => void,
+            Domain.IPv6 => [16]u8{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1}
+        };
+
+        pub const OPTION = switch(domain) {
+            Domain.Unix => enum {
+
+            },
+            Domain.IPv6 => enum {
+                /// Permits multiple AF_INET or AF_INET6 sockets to be bound
+                /// to an identical socket address.  This option must be set
+                /// on each socket (including the first socket) prior to
+                /// calling bind(2) on the socket.
+                Reuseport = libc.SO.REUSEPORT,
+            }
+        };
+
+        pub fn socket() SocketError!Self {
+            const socket = libc.socket(
+                @enumToInt(domain),
+                switch (domain) {
+                    Domain.Unix => libc.SOCK.DGRAM,
+                    Domain.IPv6 => libc.SOCK.STREAM
+                },
+                0
+            );
+            switch (socket) {
+                0 => {
+                    return Self { .file_descriptor = socket };
+                },
+                -1 => {
+                    return socket_error(errno.*);
+                },
+                else => unreachable
+            }
+        }
+        // port: in_port_t, addr: [16]u8
+        pub fn bind(self: Self, addr: Self.ADDR) BindError!void {
+            const bind_result = libc.bind(
+                self.file_descriptor,
+                @ptrCast(*const libc.sockaddr,&addr),
+                @sizeOf(ADDR)
+            );
+            switch (bind_result) {
+                0 => {
+                    return;
+                },
+                -1 => {
+                    return bind_error(errno.*);
+                },
+                else => unreachable
+            }
+        }
+        pub fn setsockopt(self: Self, comptime level: Level, comptime name: Self.OPTION, value: bool) {
+            const opt: i32 = if (value) { 1 } else { 0 };
+            const setsocketopt_result = libc.setsockopt(
+                self.file_descriptor,
+                @enumToInt(level),
+                @enumToInt(name),
+                &opt,
+                @sizeOf(opt)
+            );
+            switch (setsockopt_result) {
+                0 => {
+                    return;
+                },
+                -1 => {
+                    return setsocketopt_error(errno.*); 
+                },
+                else => unreachable
+            }
+        }
+    }
+}
+
+/// A UNIX socket.
+pub const UnixSocket = struct {
+
+};
 
 /// A TCP socket.
 pub const TcpSocket = struct {
@@ -196,13 +326,31 @@ pub const TcpSocket = struct {
 
     pub const LOCAL_HOST: [16]u8 = [_]u8{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
 
+    /// Creates a local TCP socket, binding and listening.
+    pub fn local(port: u16) !Self {
+        // Create socket
+        const socket = try Self.socket();
+        // Enable cross-process socket re-use
+        try socket.reuseport();
+        // Bind socket
+        try socket.bind(port,Self.LOCAL_HOST);
+        // Listen on socket
+        // TODO: What should be used instead of `64` as the backlog parameter?
+        try socket.listen(64);
+
+        return socket;
+    }
+
     pub fn socket() SocketError!Self {
         const socket = libc.socket(libc.AF.INET6, libc.SOCK.STREAM,0);
-        if socket == -1 {
-            return socket_error(errno.*);
-        }
-        else {
-            return Self { .file_descriptor = socket };
+        switch (socket) {
+            0 => {
+                return Self { .file_descriptor = socket };
+            },
+            -1 => {
+                return socket_error(errno.*);
+            },
+            else => unreachable
         }
     }
     pub fn reuseport(self: Self) SetsockoptError!void {
@@ -214,8 +362,14 @@ pub const TcpSocket = struct {
             @ptrCast([*]const u8,&opt),
             @sizeOf(i32)
         );
-        if setsockopt_result == -1 {
-            return setsocketopt_error(errno.*);
+        switch (setsockopt_result) {
+            0 => {
+                return;
+            },
+            -1 => {
+               return setsocketopt_error(errno.*); 
+            },.
+            else => unreachable
         }
     }
     pub fn bind(self: Self, port: in_port_t, addr: [16]u8) BindError!void {
@@ -230,8 +384,14 @@ pub const TcpSocket = struct {
             @ptrCast(*const libc.sockaddr,&addr),
             @sizeOf(libc.sockaddr.in6)
         );
-        if bind_result == -1 {
-            return bind_error(errno.*);
+        switch (bind_result) {
+            0 => {
+                return;
+            },
+            -1 => {
+                return bind_error(errno.*);
+            },
+            else => unreachable
         }
     }
     pub fn listen(self: Self, backlog: u32) ListenError!void {
@@ -241,84 +401,71 @@ pub const TcpSocket = struct {
         }
     }
 
-    /// Creates a local TCP socket, binding and listening.
-    pub fn local(port: u16) !Self {
-        const socket = try Self.socket();
-        try socket.reuseport();
-        try socket.bind(8080,Self.LOCAL_HOST);    
-        // TODO: What should be used instead of `64` as the backlog parameter?
-        try socket.listen(64);
-
-        var sigset = SignalSet.empty();
-        try sigset.add(Signal.Interrupt);
-
-
-        return socket;
-    }
-
     pub fn deinit(self:Self) void {
         _ = libc.close(self.file_descriptor);
         // TODO: Assert this returns 0.
     }
 };
 
-/// Returns a 
-pub fn SizedArrayList(comptime T: type, comptime N: type) type {
-    return struct {
-        const Self = @This();
-
-        items: [*]T,
-        length: N,
-        capacity: N,
-        allocator: Allocator,
-
-        pub fn init(allocator: Allocator) Self {
-            return Self {
-                .items = undefined,
-                .length = 0,
-                .capacity = 0,
-                .allocator = allocator,
-            };
-        }
-        pub fn deinit(self:Self) void {
-            if(@sizeOf(T) > 0) {
-                self.allocator.free(self.allocatedSlice());
-            }
-        }
-        pub fn allocatedSlice(self: Self) []T {
-            return self.items[0..@intCast(usize,self.capacity)];
-        }
-        pub fn addOne(self: *Self) void {
-            const new_length = self.length + 1;
-            try self.ensureTotalCapacity(new_length);
-            return self.addOneAssumeCapacity();
-        }
-    };
-}
+/// Name of application.
+const NAME = "neutron";
+/// Server process key.
+const KEY = "1";
+/// Directory to store process transfer sockets.
+const SOCKET_DIR = "/tmp";
+/// Fix for the socket the current server process is bound to.
+const CUR = "cur";
+/// Fix for the socket the new server process is bound to.
+const NEW = "new";
+/// Prefix for the process transfer socket.
+const SOCKET_PREFIX = SOCKET_DIR ++ "/" ++ NAME ++ KEY;
+/// The current server process socket path.
+const CURRENT_PROCESS_SOCKET = SOCKET_PREFIX ++ "-" ++ CUR;
+/// The new server process socket path.
+const NEW_PROCESS_SOCKET = SOCKET_PREFIX ++ "-" ++ NEW;;
 
 pub fn main() anyerror!void {
-    std.debug.print("Started\n", .{});
+    std.log.info("Started", .{});
     
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
+    // var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    // defer _ = gpa.deinit();
+    // std.log.info("Created allocator", .{});
 
-    std.debug.print("Created allocator\n", .{});
+    var socket = try IPv6Socket.socket();
+    defer socket.deinit();
+    try socket.setsockopt(
+        IPv6Socket.Level.Socket,
+        IPv6Socket.Option.Reuseport,
+        true
+    );
+    // TODO: Can we avoid needing to specify the domain twice here?
+    try socket.bind(IPv6Socket.IPv6.localhost(8080));
+    try socket.listen(64);
 
-    var vec = SizedArrayList(u8,i4).init(gpa.allocator());
-    defer vec.deinit();
-
-    std.debug.print("Created sized array list\n", .{});
+    // -------------------
 
     var socket = try TcpSocket.local(8080);
     defer socket.deinit();
+    std.log.info("Created socket", .{});
 
-    std.debug.print("Created TCP socket\n", .{});
+    const sigset = try SignalSet.interrupt();
+    try pthread_sigmask(sigset);
+    std.log.info("Blocked interrupt", .{});
+
+    // Check if server currently running by checking if current server process socket file exists.
+    const file = std.fs.accessAbsolute(CURRENT_PROCESS_SOCKET) catch ;
+    const new = if (file) |_void|{ true } else |_err| { false };
+    if (!new) {
+
+    }
+
+
 
     return;
 
     // const socketfd = libc.socket(libc.AF.INET6, libc.SOCK.STREAM | libc.SOCK.NONBLOCK,0);
     // try std.testing.expect(socketfd != -1);
-    // const socketfdi32 = @intCast(i32, socketfd);
+    // co nst socketfdi32 = @intCast(i32, socketfd);
 
     // std.debug.print("Created socket: {}\n", .{socketfd});
 
